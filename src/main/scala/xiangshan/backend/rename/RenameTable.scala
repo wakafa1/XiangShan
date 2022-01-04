@@ -48,6 +48,7 @@ class RenameTable(float: Boolean)(implicit p: Parameters) extends XSModule {
   // arch state rename table
   val arch_table = RegInit(VecInit(Seq.tabulate(32)(i => i.U(PhyRegIdxWidth.W))))
 
+  // 这里的时序改进看起来是比较 General 的，后续可以再看看 TODO
   // For better timing, we optimize reading and writing to RenameTable as follows:
   // (1) Writing at T0 will be actually processed at T1.
   // (2) Reading is synchronous now.
@@ -63,6 +64,8 @@ class RenameTable(float: Boolean)(implicit p: Parameters) extends XSModule {
     val matchVec = t1_wSpec_addr.map(w => w(i))
     val wMatch = ParallelPriorityMux(matchVec.reverse, t1_wSpec.map(_.data).reverse)
     // When there's a flush, we use arch_table to update spec_table.
+    // 阅读代码来看，上句注释是错的，arch_table 目前只是用来做 Difftest 了
+    // 那么，怎么进行 rename table 的复原呢？初步认为是在 ROB 里面记录了信息，然后做映射的回滚 TODO
     next := Mux(VecInit(matchVec).asUInt.orR, wMatch, spec_table(i))
   }
   spec_table := spec_table_next
@@ -76,6 +79,7 @@ class RenameTable(float: Boolean)(implicit p: Parameters) extends XSModule {
     r.data := Mux(t1_bypass.asUInt.orR, bypass_data, t1_rdata(i))
   }
 
+  // arch_table 只有写口，仅供 debug 使用
   for (w <- io.archWritePorts) {
     when (w.wen) {
       arch_table(w.addr) := w.data
@@ -92,7 +96,7 @@ class RenameTableWrapper(implicit p: Parameters) extends XSModule {
     val intRenamePorts = Vec(RenameWidth, Input(new RatWritePort))
     val fpReadPorts = Vec(RenameWidth, Vec(4, new RatReadPort))
     val fpRenamePorts = Vec(RenameWidth, Input(new RatWritePort))
-    // for debug printing
+    // debug read ports for difftest
     val debug_int_rat = Vec(32, Output(UInt(PhyRegIdxWidth.W)))
     val debug_fp_rat = Vec(32, Output(UInt(PhyRegIdxWidth.W)))
   })
@@ -103,18 +107,21 @@ class RenameTableWrapper(implicit p: Parameters) extends XSModule {
   intRat.io.debug_rdata <> io.debug_int_rat
   intRat.io.readPorts <> io.intReadPorts.flatten
   val intDestValid = io.robCommits.info.map(_.rfWen)
+  // 仅在正常 Commit 的时候更新 arch_table
   for ((arch, i) <- intRat.io.archWritePorts.zipWithIndex) {
     arch.wen  := !io.robCommits.isWalk && io.robCommits.valid(i) && intDestValid(i)
     arch.addr := io.robCommits.info(i).ldest
     arch.data := io.robCommits.info(i).pdest
     XSError(arch.wen && arch.addr === 0.U && arch.data =/= 0.U, "pdest for $0 should be 0\n")
   }
+  // 处理 rob walk 的时候，需要回滚，此时 data 就被设为 old_pdest 了，就是旧的映射关系
   for ((spec, i) <- intRat.io.specWritePorts.zipWithIndex) {
     spec.wen  := io.robCommits.isWalk && io.robCommits.valid(i) && intDestValid(i)
     spec.addr := io.robCommits.info(i).ldest
     spec.data := io.robCommits.info(i).old_pdest
     XSError(spec.wen && spec.addr === 0.U && spec.data =/= 0.U, "pdest for $0 should be 0\n")
   }
+  // 处理 rename 的表项更新
   for ((spec, rename) <- intRat.io.specWritePorts.zip(io.intRenamePorts)) {
     when (rename.wen) {
       spec.wen  := true.B
@@ -123,7 +130,7 @@ class RenameTableWrapper(implicit p: Parameters) extends XSModule {
     }
   }
 
-  // debug read ports for difftest
+  // FP 的表格是同理的东西
   fpRat.io.debug_rdata <> io.debug_fp_rat
   fpRat.io.readPorts <> io.fpReadPorts.flatten
   for ((arch, i) <- fpRat.io.archWritePorts.zipWithIndex) {
