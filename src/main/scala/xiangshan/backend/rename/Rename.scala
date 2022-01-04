@@ -198,17 +198,20 @@ class Rename(implicit p: Parameters) extends XSModule with HasPerfEvents {
 
   val bypassCond = Wire(Vec(4, MixedVec(List.tabulate(RenameWidth-1)(i => UInt((i+1).W)))))
   // 这里的 MixedVec 是可以容纳不同类型的变量的向量
-  // 这里其实是构建了一个依赖表，4 行 6 列
+  // 这里其实是构建了一个依赖表，4 行 6 列，每个里面是 (i+1).W
   //    4 代表了 4 个操作数（src+dest）
   //    6 代表了 6 个并发的 uop
+  //    i+1 代表了和前面指令的冲突情况
+  // p.s. 这部分内容和旧版本对比看会比较清晰；旧版本的 bypass 机制被移除了，直接在 rename 级就解决寄存器相关了，这应该是工艺的时序福利
+  //      https://github.com/OpenXiangShan/XiangShan/pull/1123/files
   for (i <- 1 until RenameWidth) {
     val fpCond = io.in(i).bits.ctrl.srcType.map(_ === SrcType.fp) :+ needFpDest(i)
     val intCond = io.in(i).bits.ctrl.srcType.map(_ === SrcType.reg) :+ needIntDest(i)
     val target = io.in(i).bits.ctrl.lsrc :+ io.in(i).bits.ctrl.ldest
     for ((((cond1, cond2), t), j) <- fpCond.zip(intCond).zip(target).zipWithIndex) {
       val destToSrc = io.in.take(i).zipWithIndex.map { case (in, j) =>
-        val indexMatch = in.bits.ctrl.ldest === t
-        val writeMatch =  cond2 && needIntDest(j) || cond1 && needFpDest(j)
+        val indexMatch = in.bits.ctrl.ldest === t  // 前面的指令有 dest 是我的 src/dest
+        val writeMatch = cond2 && needIntDest(j) || cond1 && needFpDest(j) // 前面的那个指令需要分配 preg 且我自己某个 src/dest 也要
         indexMatch && writeMatch
       }
       bypassCond(j)(i - 1) := VecInit(destToSrc).asUInt
@@ -228,6 +231,7 @@ class Rename(implicit p: Parameters) extends XSModule with HasPerfEvents {
     io.out(i).bits.pdest := Mux(isMove(i), io.out(i).bits.psrc(0), uops(i).pdest)
 
     // For fused-lui-load, load.src(0) is replaced by the imm.
+    // 这里是有 fusion 的逻辑了，之后细看 TODO
     val last_is_lui = io.in(i - 1).bits.ctrl.selImm === SelImm.IMM_U && io.in(i - 1).bits.ctrl.srcType(0) =/= SrcType.pc
     val this_is_load = io.in(i).bits.ctrl.fuType === FuType.ldu && !LSUOpType.isPrefetch(io.in(i).bits.ctrl.fuOpType)
     val lui_to_load = io.in(i - 1).valid && io.in(i - 1).bits.ctrl.ldest === io.in(i).bits.ctrl.lsrc(0)
