@@ -360,10 +360,12 @@ class CtrlBlockImp(outer: CtrlBlock)(implicit p: Parameters) extends LazyModuleI
   lfst.io.dispatch <> dispatch.io.lfst
 
   rat.io.robCommits := rob.io.commits
+  // 每拍不握手地都从 RAT 里面读出来 2 个 src 和一个 dest 的映射；对于浮点的话 src 会多一个
   for ((r, i) <- rat.io.intReadPorts.zipWithIndex) {
     val raddr = decode.io.out(i).bits.ctrl.lsrc.take(2) :+ decode.io.out(i).bits.ctrl.ldest
     r.map(_.addr).zip(raddr).foreach(x => x._1 := x._2)
     rename.io.intReadPorts(i) := r.map(_.data)
+    // 这里的 hold 的作用是保持读出来的数据；因为 decode 出来的内容可能暂时进不去 rename 级
     r.foreach(_.hold := !rename.io.in(i).ready)
   }
   rat.io.intRenamePorts := rename.io.intRenamePorts

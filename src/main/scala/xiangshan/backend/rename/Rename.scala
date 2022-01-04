@@ -63,7 +63,7 @@ class Rename(implicit p: Parameters) extends XSModule with HasPerfEvents {
     fl.io.redirect := io.redirect.valid
     fl.io.walk := io.robCommits.isWalk
     // when isWalk, use stepBack to restore head pointer of free list
-    // (if ME enabled, stepBack of intFreeList should be useless thus optimized out)
+    // (if ME [aka Move-Elimination] enabled, stepBack of intFreeList should be useless thus optimized out)
     fl.io.stepBack := PopCount(io.robCommits.valid.zip(io.robCommits.info).map{case (v, i) => v && needDestRegCommit(isFp, i)})
   }
   // walk has higher priority than allocation and thus we don't use isWalk here
@@ -76,6 +76,7 @@ class Rename(implicit p: Parameters) extends XSModule with HasPerfEvents {
 
 
   // speculatively assign the instruction with an robIdx
+  // 为什么这里要搞 robIdx? TODO
   val validCount = PopCount(io.in.map(_.valid)) // number of instructions waiting to enter rob (from decode)
   val robIdxHead = RegInit(0.U.asTypeOf(new RobPtr))
   val lastCycleMisprediction = RegNext(io.redirect.valid && !io.redirect.bits.flushItself())
@@ -104,7 +105,6 @@ class Rename(implicit p: Parameters) extends XSModule with HasPerfEvents {
   val hasValid = Cat(io.in.map(_.valid)).orR
 
   val isMove = io.in.map(_.bits.ctrl.isMove)
-  val intPsrc = Wire(Vec(RenameWidth, UInt()))
 
   val intSpecWen = Wire(Vec(RenameWidth, Bool()))
   val fpSpecWen = Wire(Vec(RenameWidth, Bool()))
@@ -135,9 +135,9 @@ class Rename(implicit p: Parameters) extends XSModule with HasPerfEvents {
 
     uops(i).robIdx := robIdxHead + PopCount(io.in.take(i).map(_.valid))
 
+    // 根据 RAT 的结果，把 psrc_i 和 old_pdest 都配置好
     val intPhySrcVec = io.intReadPorts(i).take(2)
     val intOldPdest = io.intReadPorts(i).last
-    intPsrc(i) := intPhySrcVec(0)
     val fpPhySrcVec = io.fpReadPorts(i).take(3)
     val fpOldPdest = io.fpReadPorts(i).last
     uops(i).psrc(0) := Mux(uops(i).ctrl.srcType(0) === SrcType.reg, intPhySrcVec(0), fpPhySrcVec(0))
@@ -146,7 +146,7 @@ class Rename(implicit p: Parameters) extends XSModule with HasPerfEvents {
     uops(i).old_pdest := Mux(uops(i).ctrl.rfWen, intOldPdest, fpOldPdest)
     uops(i).eliminatedMove := isMove(i)
 
-    // update pdest
+    // update pdest，从 Freelist 里面搞来的
     uops(i).pdest := Mux(needIntDest(i), intFreeList.io.allocatePhyReg(i), // normal int inst
       // normal fp inst
       Mux(needFpDest(i), fpFreeList.io.allocatePhyReg(i),
@@ -163,9 +163,11 @@ class Rename(implicit p: Parameters) extends XSModule with HasPerfEvents {
 
     // write speculative rename table
     // we update rat later inside commit code
+    // 这里的 SpecWen 就是在 FreeList 里面搞到了空位，需要建立新映射的标识
     intSpecWen(i) := needIntDest(i) && intFreeList.io.canAllocate && intFreeList.io.doAllocate && !io.robCommits.isWalk && !io.redirect.valid
     fpSpecWen(i) := needFpDest(i) && fpFreeList.io.canAllocate && fpFreeList.io.doAllocate && !io.robCommits.isWalk && !io.redirect.valid
 
+    // 为了做 ME，pdest 的内容需要更新到 RefCnt 里面去
     intRefCounter.io.allocate(i).valid := intSpecWen(i)
     intRefCounter.io.allocate(i).bits := io.out(i).bits.pdest
   }
@@ -190,9 +192,15 @@ class Rename(implicit p: Parameters) extends XSModule with HasPerfEvents {
     *                                                 rat_out(N))...)),
     *                           freelist_out(N))
     */
+
   // a simple functional model for now
   io.out(0).bits.pdest := Mux(isMove(0), uops(0).psrc.head, uops(0).pdest)
+
   val bypassCond = Wire(Vec(4, MixedVec(List.tabulate(RenameWidth-1)(i => UInt((i+1).W)))))
+  // 这里的 MixedVec 是可以容纳不同类型的变量的向量
+  // 这里其实是构建了一个依赖表，4 行 6 列
+  //    4 代表了 4 个操作数（src+dest）
+  //    6 代表了 6 个并发的 uop
   for (i <- 1 until RenameWidth) {
     val fpCond = io.in(i).bits.ctrl.srcType.map(_ === SrcType.fp) :+ needFpDest(i)
     val intCond = io.in(i).bits.ctrl.srcType.map(_ === SrcType.reg) :+ needIntDest(i)
@@ -250,11 +258,8 @@ class Rename(implicit p: Parameters) extends XSModule with HasPerfEvents {
       val commitDestValid = io.robCommits.valid(i) && needDestRegCommit(fp, io.robCommits.info(i))
       XSDebug(p"isFp[${fp}]index[$i]-commitDestValid:$commitDestValid,isWalk:${io.robCommits.isWalk}\n")
 
-      /*
-      I. RAT Update
-       */
-
-      // walk back write - restore spec state : ldest => old_pdest
+      /* I. RAT Update */
+      // 这里是将 rename 建立的新映射关系更新到 RAT 里面去；
       if (fp && i < RenameWidth) {
         // When redirect happens (mis-prediction), don't update the rename table
         rat(i).wen := fpSpecWen(i)
@@ -266,12 +271,12 @@ class Rename(implicit p: Parameters) extends XSModule with HasPerfEvents {
         rat(i).data := io.out(i).bits.pdest
       }
 
-      /*
-      II. Free List Update
-       */
+      /* II. Free List Update */
+      // 这里是当指令提交后，释放 FreeList 的逻辑
+      // 为了做 ME，Int 的 FreeList 有 RefCnt 的设计 TODO
       if (fp) { // Float Point free list
         fpFreeList.io.freeReq(i)  := commitDestValid && !io.robCommits.isWalk
-        fpFreeList.io.freePhyReg(i) := io.robCommits.info(i).old_pdest
+        fpFreeList.io.freePhyReg(i) := io.robCommits.info(i).old_pdest // 对于没有 ME 的 FP Freelist，可以看到要释放的就是 old_pdest，符合算法
       } else { // Integer free list
         intFreeList.io.freeReq(i) := intRefCounter.io.freeRegs(i).valid
         intFreeList.io.freePhyReg(i) := intRefCounter.io.freeRegs(i).bits
