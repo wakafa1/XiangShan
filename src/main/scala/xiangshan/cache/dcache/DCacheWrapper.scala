@@ -169,6 +169,7 @@ trait HasDCacheParameters extends HasL1CacheParameters {
     out <> arb.io.out
   }
 
+  // 仲裁完后加一级流水，且永远不会 flush
   def arbiter_with_pipereg[T <: Bundle](
     in: Seq[DecoupledIO[T]],
     out: DecoupledIO[T],
@@ -372,7 +373,7 @@ class DCache()(implicit p: Parameters) extends LazyModule with HasDCacheParamete
   val clientParameters = TLMasterPortParameters.v1(
     Seq(TLMasterParameters.v1(
       name = "dcache",
-      sourceId = IdRange(0, nEntries + 1),
+      sourceId = IdRange(0, nEntries + 1),  // 现在 release 和 miss 之间的 sourceid 是隔离的了，nEntries = nMissEntries + nReleaseEntries + 1，这里相当于额外加了 2，作用是？ TODO
       supportsProbe = TransferSizes(cfg.blockBytes)
     )),
     requestFields = cacheParams.reqFields,
@@ -471,6 +472,7 @@ class DCacheImp(outer: DCache) extends LazyModuleImp(outer) with HasDCacheParame
   // data array
 
   val dataWriteArb = Module(new Arbiter(new L1BankedDataWriteReq, 2))
+  // refillPipe 无阻塞，优先级更高
   dataWriteArb.io.in(0) <> refillPipe.io.data_write
   dataWriteArb.io.in(1) <> mainPipe.io.data_write
 
@@ -480,7 +482,7 @@ class DCacheImp(outer: DCache) extends LazyModuleImp(outer) with HasDCacheParame
   mainPipe.io.readline_error := bankedDataArray.io.readline_error
   mainPipe.io.data_resp := bankedDataArray.io.resp
 
-  (0 until LoadPipelineWidth).map(i => {
+  (0 until LoadPipelineWidth).foreach(i => {
     bankedDataArray.io.read(i) <> ldu(i).io.banked_data_read
     bankedDataArray.io.read_error(i) <> ldu(i).io.read_error
 
@@ -710,6 +712,7 @@ class DCacheImp(outer: DCache) extends LazyModuleImp(outer) with HasDCacheParame
   generatePerfEvent()
 }
 
+// 这玩意儿是用在 fakeDCache 里的，不用关心
 class AMOHelper() extends ExtModule {
   val clock  = IO(Input(Clock()))
   val enable = IO(Input(Bool()))
@@ -720,6 +723,7 @@ class AMOHelper() extends ExtModule {
   val rdata  = IO(Output(UInt(64.W)))
 }
 
+// 这个模块是 Diplomacy 最外的 wrapper，无实际逻辑
 class DCacheWrapper()(implicit p: Parameters) extends LazyModule with HasXSParameter {
 
   val useDcache = coreParams.dcacheParametersOpt.nonEmpty

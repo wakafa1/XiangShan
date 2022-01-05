@@ -277,7 +277,7 @@ class Rename(implicit p: Parameters) extends XSModule with HasPerfEvents {
 
       /* II. Free List Update */
       // 这里是当指令提交后，释放 FreeList 的逻辑
-      // 为了做 ME，Int 的 FreeList 有 RefCnt 的设计 TODO
+      // 为了做 ME，Int 的 FreeList 有 RefCnt 的设计
       if (fp) { // Float Point free list
         fpFreeList.io.freeReq(i)  := commitDestValid && !io.robCommits.isWalk
         fpFreeList.io.freePhyReg(i) := io.robCommits.info(i).old_pdest // 对于没有 ME 的 FP Freelist，可以看到要释放的就是 old_pdest，符合算法

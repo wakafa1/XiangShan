@@ -142,6 +142,7 @@ class MemWaitUpdateReq(implicit p: Parameters) extends XSBundle {
   val stdIssue = Vec(exuParameters.StuCnt, ValidIO(new ExuInput))
 }
 
+// 这里的代码就是简单地让 in 和 out 之间加一级流水，果壳里面用得挺多
 object AddPipelineReg {
   class PipelineRegModule[T <: Data](gen: T) extends Module {
     val io = IO(new Bundle() {

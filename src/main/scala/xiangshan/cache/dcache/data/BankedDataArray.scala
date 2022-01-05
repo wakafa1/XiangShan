@@ -136,6 +136,7 @@ class BankedDataArray(implicit p: Parameters) extends AbstractBankedDataArray {
 
   val ReduceReadlineConflict = false
 
+  // 写优先级总是高的，照应 refillPipe 无阻塞
   io.write.ready := true.B
 
   // wrap data rows of 8 ways
@@ -159,6 +160,7 @@ class BankedDataArray(implicit p: Parameters) extends AbstractBankedDataArray {
     val r_way_en_reg = RegNext(io.r.way_en)
 
     // multiway data bank
+    // 这种写法是，每一个 way 都可以单独地进行读写
     val data_bank = Array.fill(DCacheWays) {
       Module(new SRAMTemplate(
         Bits(DCacheSRAMRowBits.W),
@@ -178,10 +180,14 @@ class BankedDataArray(implicit p: Parameters) extends AbstractBankedDataArray {
         data = io.w.data,
         waymask = 1.U
       )
+      // 读的时候会把每一个 way 都读出来，读完后再根据 way_en 来选通，这是时序考虑
       data_bank(w).io.r.req.valid := io.r.en
       data_bank(w).io.r.req.bits.apply(setIdx = io.r.addr)
     }
 
+    // 这里的逻辑有点意思，应该是时序考虑
+    // 读出来所有 way 的数据之后，并不直接用一个选择逻辑，而是先用 half 来看是否是前 half 个 way 的，从而降低 mux 连级的延迟
+    // 这里本质上可以用 parallelMux？
     val half = nWays / 2
     val data_read = data_bank.map(_.io.r.resp.data(0))
     val data_left = Mux1H(r_way_en_reg.tail(half), data_read.take(half))
@@ -218,7 +224,8 @@ class BankedDataArray(implicit p: Parameters) extends AbstractBankedDataArray {
     }
   }
 
-  val data_banks = List.tabulate(DCacheBanks)(i => Module(new DataSRAMBank(i)))
+  // 这里分 bank 是根据 Offset 的高位来分的，换句话说，每一个 Cacheline 是 512，但是分了 8 个 Bank 后，每个里面存的就是 64 了
+  val data_banks = List.tabulate(DCacheBanks)(i => Module(new DataSRAMBank(i))) // 这里的 index 都没被用到...
   val ecc_banks = List.fill(DCacheBanks)(Module(new SRAMTemplate(
     Bits(eccBits.W),
     set = DCacheSets,
@@ -237,9 +244,10 @@ class BankedDataArray(implicit p: Parameters) extends AbstractBankedDataArray {
 
   // read data_banks and ecc_banks
   // for single port SRAM, do not allow read and write in the same cycle
+  // 这里需要处理的一个逻辑是，同一周期同时读写怎么办；目前的策略是如果有写则不允许读
   val rwhazard = io.write.valid
   val rrhazard = false.B // io.readline.valid
-  (0 until LoadPipelineWidth).map(rport_index => {
+  (0 until LoadPipelineWidth).foreach(rport_index => {  // 有几个 loadPipe
     set_addrs(rport_index) := addr_to_dcache_set(io.read(rport_index).bits.addr)
     bank_addrs(rport_index) := addr_to_dcache_bank(io.read(rport_index).bits.addr)
 
@@ -256,10 +264,16 @@ class BankedDataArray(implicit p: Parameters) extends AbstractBankedDataArray {
   dontTouch(bank_result)
   val read_bank_error = Wire(Vec(DCacheBanks, Bool()))
   dontTouch(read_bank_error)
+
+  // 下面的逻辑解决了，如果同时有 read 和 readline，或者两个 loadPipe 之间的 read 是相同的如何处理
+  // 之后可以对照 HuanCun 里面的 BankedStore 的写法来看
+
+  // 两个 loadPipe 之间冲突
   val rr_bank_conflict = bank_addrs(0) === bank_addrs(1) && io.read(0).valid && io.read(1).valid
+  // loadPipe 和 readline 之间冲突
   val rrl_bank_conflict_0 = Wire(Bool())
   val rrl_bank_conflict_1 = Wire(Bool())
-  if (ReduceReadlineConflict) {
+  if (ReduceReadlineConflict) {  // false
     rrl_bank_conflict_0 := io.read(0).valid && io.readline.valid && io.readline.bits.rmask(bank_addrs(0))
     rrl_bank_conflict_1 := io.read(1).valid && io.readline.valid && io.readline.bits.rmask(bank_addrs(1))
   } else {
@@ -270,6 +284,7 @@ class BankedDataArray(implicit p: Parameters) extends AbstractBankedDataArray {
   val rw_bank_conflict_0 = io.read(0).valid && rwhazard
   val rw_bank_conflict_1 = io.read(1).valid && rwhazard
   val perf_multi_read = io.read(0).valid && io.read(1).valid
+  // 看起来是把 conflict 信息传到了外面，看看外面是怎么处理的 TODO
   io.bank_conflict_fast(0) := rw_bank_conflict_0 || rrl_bank_conflict_0
   io.bank_conflict_slow(0) := RegNext(io.bank_conflict_fast(0))
   io.bank_conflict_fast(1) := rw_bank_conflict_1 || rrl_bank_conflict_1 || rr_bank_conflict
@@ -286,6 +301,7 @@ class BankedDataArray(implicit p: Parameters) extends AbstractBankedDataArray {
   XSPerfAccumulate("data_array_read_line", io.readline.valid)
   XSPerfAccumulate("data_array_write", io.write.valid)
 
+  // 读各个 Bank 的逻辑
   for (bank_index <- 0 until DCacheBanks) {
     //     Set Addr & Read Way Mask
     //
@@ -353,6 +369,7 @@ class BankedDataArray(implicit p: Parameters) extends AbstractBankedDataArray {
 
   // write data_banks & ecc_banks
   val sram_waddr = addr_to_dcache_set(io.write.bits.addr)
+  // 写各个 Bank 的逻辑
   for (bank_index <- 0 until DCacheBanks) {
     // data write
     val data_bank = data_banks(bank_index)

@@ -342,6 +342,9 @@ class RobImp(outer: Rob)(implicit p: Parameters) extends LazyModuleImp(outer)
   /**
     * states of Rob
     */
+  // s_idle 是正常的执行状态
+  // s_walk 是出现了问题需要回滚的状态
+  // s_extrawalk 是什么呢？看起来它最多执行一拍，似乎是把 dispatch 当拍要 enq 进来的无效掉，之后细看 TODO
   val s_idle :: s_walk :: s_extrawalk :: Nil = Enum(3)
   val state = RegInit(s_idle)
 
@@ -510,6 +513,7 @@ class RobImp(outer: Rob)(implicit p: Parameters) extends LazyModuleImp(outer)
   val walkFinished = walkCounter <= CommitWidth.U
 
   // extra space is used when rob has no enough space, but mispredict recovery needs such info to walk regmap
+  // MPR 是 MisPredict Recovery 的缩写
   require(RenameWidth <= CommitWidth)
   val extraSpaceForMPR = Reg(Vec(RenameWidth, new RobDispatchData))
   val usedSpaceForMPR = Reg(Vec(RenameWidth, Bool()))

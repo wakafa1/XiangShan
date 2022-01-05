@@ -40,6 +40,9 @@ class RefillPipeReq(implicit p: Parameters) extends DCacheBundle {
   def idx: UInt = get_idx(paddrWithVirtualAlias)
 }
 
+// 这个模块过于简单，它甚至不能称之为 “pipe”，就是从 missqueue 里面接收请求然后分发给其他各个部件完成回填，不带时序逻辑
+// 有个潜在假设是参与回填的部件都是 ready 的，需要注意
+// 设计是无阻塞的，即 io.req.ready === true.B，req fire 的当拍直接给 missqueue 返 resp.valid
 class RefillPipe(implicit p: Parameters) extends DCacheModule {
   val io = IO(new Bundle() {
     val req = Flipped(DecoupledIO(new RefillPipeReq))
