@@ -228,7 +228,7 @@ class Rename(implicit p: Parameters) extends XSModule with HasPerfEvents {
     io.out(i).bits.old_pdest := io.out.take(i).map(_.bits.pdest).zip(bypassCond(3)(i-1).asBools).foldLeft(uops(i).old_pdest) {
       (z, next) => Mux(next._2, next._1, z)
     }
-    io.out(i).bits.pdest := Mux(isMove(i), io.out(i).bits.psrc(0), uops(i).pdest)
+    io.out(i).bits.pdest := Mux(isMove(i), io.out(i).bits.psrc(0), uops(i).pdest)  // 如果是 move 指令，直接把 pdest 设置为 psrc
 
     // For fused-lui-load, load.src(0) is replaced by the imm.
     // 这里是有 fusion 的逻辑了，之后细看 TODO

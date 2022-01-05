@@ -24,10 +24,12 @@ class CircularQueuePtr[T <: CircularQueuePtr[T]](val entries: Int) extends Bundl
 
   def this(f: Parameters => Int)(implicit p: Parameters) = this(f(p))
 
+  // 这是循环队列指针的通用表达方式，由 {flag, ptr} 组成
   val PTR_WIDTH = log2Up(entries)
   val flag = Bool()
   val value = UInt(PTR_WIDTH.W)
 
+  // 用 printf 打印的时候，会调用该模块的 toPrintable 函数，如果没有 override，则就使用默认的
   override def toPrintable: Printable = {
     p"$flag:$value"
   }
@@ -36,10 +38,10 @@ class CircularQueuePtr[T <: CircularQueuePtr[T]](val entries: Int) extends Bundl
     val entries = this.entries
     val new_ptr = Wire(this.asInstanceOf[T].cloneType)
     if(isPow2(entries)){
-      new_ptr := (Cat(this.flag, this.value) + v).asTypeOf(new_ptr)
+      new_ptr := (Cat(this.flag, this.value) + v).asTypeOf(new_ptr)  // 这里有点意思，其实 flag 是作为一个进位符来使用的
     } else {
       val new_value = this.value +& v
-      val diff = Cat(0.U(1.W), new_value).asSInt() - Cat(0.U(1.W), entries.U.asTypeOf(new_value)).asSInt()
+      val diff = Cat(0.U(1.W), new_value).asSInt() - Cat(0.U(1.W), entries.U.asTypeOf(new_value)).asSInt()  // 如果 new_value 溢出了，就要 reverse flag
       val reverse_flag = diff >= 0.S
       new_ptr.flag := Mux(reverse_flag, !this.flag, this.flag)
       new_ptr.value := Mux(reverse_flag,
@@ -51,13 +53,14 @@ class CircularQueuePtr[T <: CircularQueuePtr[T]](val entries: Int) extends Bundl
   }
 
   final def -(v: UInt): T = {
-    val flipped_new_ptr = this + (this.entries.U - v)
+    val flipped_new_ptr = this + (this.entries.U - v)  // “减法就是加法”
     val new_ptr = Wire(this.asInstanceOf[T].cloneType)
     new_ptr.flag := !flipped_new_ptr.flag
     new_ptr.value := flipped_new_ptr.value
     new_ptr
   }
 
+  // 判断相等和不等需要同时比较 flag 和 ptr
   final def === (that_ptr: T): Bool = this.asUInt()===that_ptr.asUInt()
 
   final def =/= (that_ptr: T): Bool = this.asUInt()=/=that_ptr.asUInt()

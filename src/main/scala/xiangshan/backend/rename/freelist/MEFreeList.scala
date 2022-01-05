@@ -22,7 +22,7 @@ import chisel3.util._
 import xiangshan._
 import utils._
 
-
+// 看起来这个模块和 StdFreeList 没啥大差别；差别主要是外面，只有当 RefCnt=0 的时候才 free
 class MEFreeList(size: Int)(implicit p: Parameters) extends BaseFreeList(size) with HasPerfEvents {
   val freeList = Mem(size, UInt(PhyRegIdxWidth.W))
 

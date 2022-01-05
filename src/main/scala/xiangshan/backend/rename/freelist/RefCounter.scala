@@ -23,7 +23,8 @@ import xiangshan._
 import utils._
 
 
-
+// 文档中有写道 "counter 是有上限的 (2-bit)，一个物理寄存器最多被引用3次"，我们是不是解除了这个限制？
+// 文档中有写道 "counter 在一个周期内不能处理对同一个物理寄存器的两次及以上的 ref++ 请求"，我们是不是解除了这个限制？
 class RefCounter(size: Int)(implicit p: Parameters) extends XSModule {
   val io = IO(new Bundle {
     val allocate = Vec(RenameWidth, Flipped(ValidIO(UInt(PhyRegIdxWidth.W))))

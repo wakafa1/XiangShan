@@ -22,7 +22,7 @@ import chisel3.util._
 import xiangshan._
 import utils._
 
-
+// 这个模块就是简单维护一个循环队列，当 FreeReq 的时候，入队；当 AllocReq 的时候，出队
 class StdFreeList(size: Int)(implicit p: Parameters) extends BaseFreeList(size) with HasPerfEvents {
 
   val freeList = RegInit(VecInit(Seq.tabulate(size)( i => (i + 32).U(PhyRegIdxWidth.W) )))
@@ -32,6 +32,7 @@ class StdFreeList(size: Int)(implicit p: Parameters) extends BaseFreeList(size) 
   //
   // free committed instructions' `old_pdest` reg
   //
+  // 因为请求宽度为 CommitWidth，所以 offset 需要用 popcount 来算
   for (i <- 0 until CommitWidth) {
     val offset = if (i == 0) 0.U else PopCount(io.freeReq.take(i))
     val ptr = tailPtr + offset
