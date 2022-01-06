@@ -24,6 +24,7 @@ import utils.{Code, ParallelOR, ReplacementPolicy, SRAMTemplate, XSDebug}
 
 import scala.math.max
 
+// 此模块暂时被弃用
 class DuplicatedDataArray(implicit p: Parameters) extends AbstractDataArray {
   val singlePort = true
   val readHighPriority = false

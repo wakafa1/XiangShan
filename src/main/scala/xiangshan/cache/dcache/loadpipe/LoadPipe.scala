@@ -23,6 +23,7 @@ import freechips.rocketchip.tilelink.ClientMetadata
 import utils.{HasPerfEvents, XSDebug, XSPerfAccumulate}
 import xiangshan.L1CacheErrorInfo
 
+// 该模块的流水级写得很典型，可以以后作参考
 class LoadPipe(id: Int)(implicit p: Parameters) extends DCacheModule with HasPerfEvents {
   val io = IO(new DCacheBundle {
     // incoming requests
@@ -61,16 +62,17 @@ class LoadPipe(id: Int)(implicit p: Parameters) extends DCacheModule with HasPer
     val error = Output(new L1CacheErrorInfo())
   })
 
+  // meta 读口充足
   assert(RegNext(io.meta_read.ready))
 
   val s1_ready = Wire(Bool())
   val s2_ready = Wire(Bool())
+
   // LSU requests
-  // it you got nacked, you can directly passdown
+  // 下面这段的逻辑就是只有 3 个资源（meta, tag, s1）都 ready 了才接收 req
   val not_nacked_ready = io.meta_read.ready && io.tag_read.ready && s1_ready
   val nacked_ready     = true.B
-
-  // ready can wait for valid
+  // neck 机制已经被取消了，io.nack 永远为 false
   io.lsu.req.ready := (!io.nack && not_nacked_ready) || (io.nack && nacked_ready)
   io.meta_read.valid := io.lsu.req.fire() && !io.nack
   io.tag_read.valid := io.lsu.req.fire() && !io.nack
@@ -81,7 +83,6 @@ class LoadPipe(id: Int)(implicit p: Parameters) extends DCacheModule with HasPer
   // Tag read for new requests
   meta_read.idx := get_idx(io.lsu.req.bits.addr)
   meta_read.way_en := ~0.U(nWays.W)
-//  meta_read.tag := DontCare
 
   tag_read.idx := get_idx(io.lsu.req.bits.addr)
   tag_read.way_en := ~0.U(nWays.W)
@@ -115,6 +116,7 @@ class LoadPipe(id: Int)(implicit p: Parameters) extends DCacheModule with HasPer
   dump_pipeline_reqs("LoadPipe s1", s1_valid, s1_req)
 
   // tag check
+  // meta 和 tag 都读出来了，检查 hit 情况
   val meta_resp = io.meta_resp
   val tag_resp = io.tag_resp.map(r => r(tagBits - 1, 0))
   def wayMap[T <: Data](f: Int => T) = VecInit((0 until nWays).map(f))
@@ -124,7 +126,7 @@ class LoadPipe(id: Int)(implicit p: Parameters) extends DCacheModule with HasPer
   assert(RegNext(!s1_valid || PopCount(s1_tag_match_way) <= 1.U), "tag should not match with more than 1 way")
 
   val s1_fake_meta = Wire(new Meta)
-//  s1_fake_meta.tag := get_tag(s1_addr)
+  // s1_fake_meta.tag := get_tag(s1_addr)
   s1_fake_meta.coh := ClientMetadata.onReset
   val s1_fake_tag = get_tag(s1_addr)
 
@@ -134,12 +136,14 @@ class LoadPipe(id: Int)(implicit p: Parameters) extends DCacheModule with HasPer
   val s1_hit_coh = s1_hit_meta.coh
   val s1_hit_error = Mux(s1_tag_match, Mux1H(s1_tag_match_way, wayMap((w: Int) => io.error_flag_resp(w))), false.B)
 
+  // 获得 replace way，并摘取信息
   io.replace_way.set.valid := RegNext(s0_fire)
   io.replace_way.set.bits := get_idx(s1_vaddr)
   val s1_repl_way_en = UIntToOH(io.replace_way.way)
   val s1_repl_tag = Mux1H(s1_repl_way_en, wayMap(w => tag_resp(w)))
   val s1_repl_coh = Mux1H(s1_repl_way_en, wayMap(w => meta_resp(w).coh))
 
+  // 一旦 tag 没有 match，那一定就需要 replace 了，s1_coh/tag 就保存的是当前需要处理的这一路的信息
   val s1_need_replacement = !s1_tag_match
   val s1_way_en = Mux(s1_need_replacement, s1_repl_way_en, s1_tag_match_way)
   val s1_coh = Mux(s1_need_replacement, s1_repl_coh, s1_hit_coh)
@@ -150,6 +154,7 @@ class LoadPipe(id: Int)(implicit p: Parameters) extends DCacheModule with HasPer
   io.banked_data_read.bits.addr := s1_vaddr
   io.banked_data_read.bits.way_en := s1_tag_match_way
 
+  // 下面这几行主要是给外面的 replacer 作 touch 用的
   io.replace_access.valid := RegNext(RegNext(io.meta_read.fire()) && s1_tag_match && s1_valid)
   io.replace_access.bits.set := RegNext(get_idx(s1_req.addr))
   io.replace_access.bits.way := RegNext(OHToUInt(s1_tag_match_way))
@@ -158,7 +163,7 @@ class LoadPipe(id: Int)(implicit p: Parameters) extends DCacheModule with HasPer
   val s1_has_permission = s1_hit_coh.onAccess(s1_req.cmd)._1
   val s1_new_hit_coh = s1_hit_coh.onAccess(s1_req.cmd)._3
   val s1_hit = s1_tag_match && s1_has_permission && s1_hit_coh === s1_new_hit_coh
-  val s1_will_send_miss_req = s1_valid && !s1_nack && !s1_nack_data && !s1_hit
+  val s1_will_send_miss_req = s1_valid && !s1_nack && !s1_nack_data && !s1_hit  // 当前有效、没有 hit、data读出来了，才会发 miss_req
 
   // check ecc error
   val s1_encTag = Mux1H(s1_tag_match_way, wayMap((w: Int) => io.tag_resp(w)))
@@ -176,9 +181,8 @@ class LoadPipe(id: Int)(implicit p: Parameters) extends DCacheModule with HasPer
   val s2_bank_oh = RegEnable(s1_bank_oh, s1_fire)
   s2_ready := true.B
 
-  when (s1_fire) { s2_valid := !io.lsu.s1_kill }
-  .elsewhen(io.lsu.resp.fire()) { s2_valid := false.B }
-
+  when (s1_fire) { s2_valid := !io.lsu.s1_kill }  // s1_kill 是怎么生成的？ TODO
+  .elsewhen(io.lsu.resp.fire()) { s2_valid := false.B }  // s2 是最后一级，如果 s1 没来且给 lsu resp 了，那么自然 s2_valid 就是 false 了
   dump_pipeline_reqs("LoadPipe s2", s2_valid, s2_req)
 
   // hit, miss, nack, permission checking
@@ -196,14 +200,14 @@ class LoadPipe(id: Int)(implicit p: Parameters) extends DCacheModule with HasPer
 
   // when req got nacked, upper levels should replay this request
   // nacked or not
-  val s2_nack_hit = RegEnable(s1_nack, s1_fire)
+  val s2_nack_hit = RegEnable(s1_nack, s1_fire)  // 恒为 false
   // can no allocate mshr for load miss
   val s2_nack_no_mshr = io.miss_req.valid && !io.miss_req.ready
   // Bank conflict on data arrays
   val s2_nack_data = RegEnable(!io.banked_data_read.ready, s1_fire)
   val s2_nack = s2_nack_hit || s2_nack_no_mshr || s2_nack_data
 
-  val banked_data_resp = io.banked_data_resp
+  val banked_data_resp = io.banked_data_resp  // s1 读 data，s2 返回数据
   val s2_bank_addr = addr_to_dcache_bank(s2_addr)
   val banked_data_resp_word = Mux1H(s2_bank_oh, io.banked_data_resp) // io.banked_data_resp(s2_bank_addr)
   dontTouch(s2_bank_addr)
@@ -226,7 +230,8 @@ class LoadPipe(id: Int)(implicit p: Parameters) extends DCacheModule with HasPer
   val s2_can_send_miss_req = RegEnable(s1_will_send_miss_req, s1_fire)
 
   // send load miss to miss queue
-  io.miss_req.valid := s2_valid && s2_can_send_miss_req
+  io.miss_req.valid := s2_valid && s2_can_send_miss_req  // 根据 s1 得来的 can_send_miss_req 给 missQueue 发请求
+  // 疑问：为什么要根据 s1 时刻的 io.banked_data_read.ready 来判断 s2 是否能发 missQueue？ TODO
   io.miss_req.bits := DontCare
   io.miss_req.bits.source := s2_instrtype
   io.miss_req.bits.cmd := s2_req.cmd
@@ -236,7 +241,7 @@ class LoadPipe(id: Int)(implicit p: Parameters) extends DCacheModule with HasPer
   io.miss_req.bits.req_coh := s2_hit_coh
   io.miss_req.bits.replace_coh := s2_repl_coh
   io.miss_req.bits.replace_tag := s2_repl_tag
-  io.miss_req.bits.cancel := io.lsu.s2_kill
+  io.miss_req.bits.cancel := io.lsu.s2_kill  // kill 信号再一次出现
 
   // send back response
   val resp = Wire(ValidIO(new DCacheWordResp))
@@ -252,6 +257,9 @@ class LoadPipe(id: Int)(implicit p: Parameters) extends DCacheModule with HasPer
   // * report a miss if bank conflict is detected
   val real_miss = !s2_hit
   resp.bits.miss := real_miss || io.bank_conflict_slow
+  // 有几种情况需要通知 lsq 做 replay
+  //   1. 出现了 bank 冲突（只有 id > 0 的 loadpipe 才会出现 bank 冲突，因为有优先级）
+  //   2. 因为竞争导致一些该发的 request 没有发出去，详见 s2_nack
   if (id == 0) {
     // load pipe 0 will not be influenced by bank conflict
     resp.bits.replay := resp.bits.miss && (!io.miss_req.fire() || s2_nack)

@@ -579,6 +579,7 @@ class DCacheImp(outer: DCache) extends LazyModuleImp(outer) with HasDCacheParame
   //----------------------------------------
   // replace (main pipe)
   // missQueue 发出 replace 请求，交由 mainPipe 处理
+  // 原来的设计中除了 mainPipe 还有一个额外的 replacePipe，后来发现两者职能相同，就进行合并了
   val mpStatus = mainPipe.io.status
   mainPipe.io.replace_req <> missQueue.io.replace_pipe_req
   missQueue.io.replace_pipe_resp := mainPipe.io.replace_resp
