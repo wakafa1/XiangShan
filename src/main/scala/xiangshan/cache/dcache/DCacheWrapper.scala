@@ -415,7 +415,7 @@ class DCacheImp(outer: DCache) extends LazyModuleImp(outer) with HasDCacheParame
   //----------------------------------------
   // core modules
   val ldu = Seq.tabulate(LoadPipelineWidth)({ i => Module(new LoadPipe(i))})
-  val atomicsReplayUnit = Module(new AtomicsReplayEntry)
+  val atomicsReplayUnit = Module(new AtomicsReplayEntry)  // 这玩意儿是啥？ TODO
   val mainPipe   = Module(new MainPipe)
   val refillPipe = Module(new RefillPipe)
   val missQueue  = Module(new MissQueue(edge))
@@ -430,10 +430,12 @@ class DCacheImp(outer: DCache) extends LazyModuleImp(outer) with HasDCacheParame
 
   //----------------------------------------
   // meta array
+  // 2个 ldu 和 mainpipe 会读 meta，读口充足
   val meta_read_ports = ldu.map(_.io.meta_read) ++
     Seq(mainPipe.io.meta_read)
   val meta_resp_ports = ldu.map(_.io.meta_resp) ++
     Seq(mainPipe.io.meta_resp)
+  // mainpipe 和 refill pipe 会写 meta，写口充足
   val meta_write_ports = Seq(
     mainPipe.io.meta_write,
     refillPipe.io.meta_write
@@ -454,6 +456,7 @@ class DCacheImp(outer: DCache) extends LazyModuleImp(outer) with HasDCacheParame
 
   //----------------------------------------
   // tag array
+  // 同样地，2个 ldu 和 mainpipe 会读 tag，读口充足
   require(tagArray.io.read.size == (ldu.size + 1))
   ldu.zipWithIndex.foreach {
     case (ld, i) =>
@@ -462,7 +465,7 @@ class DCacheImp(outer: DCache) extends LazyModuleImp(outer) with HasDCacheParame
   }
   tagArray.io.read.last <> mainPipe.io.tag_read
   mainPipe.io.tag_resp := tagArray.io.resp.last
-
+  // refillPipe 和 mainPipe 会写 tag，写口仅 1 个，需要仲裁， refillPipe 必须高优先级
   val tag_write_arb = Module(new Arbiter(new TagWriteReq, 2))
   tag_write_arb.io.in(0) <> refillPipe.io.tag_write
   tag_write_arb.io.in(1) <> mainPipe.io.tag_write
@@ -512,25 +515,26 @@ class DCacheImp(outer: DCache) extends LazyModuleImp(outer) with HasDCacheParame
   // atomics not finished yet
   io.lsu.atomics <> atomicsReplayUnit.io.lsu
   atomicsReplayUnit.io.pipe_resp := RegNext(mainPipe.io.atomic_resp)
-  atomicsReplayUnit.io.block_lr <> mainPipe.io.block_lr
+  atomicsReplayUnit.io.block_lr <> mainPipe.io.block_lr  // 这里是 lr/sc 的东西，之后细看 TODO
 
   //----------------------------------------
   // miss queue
   val MissReqPortCount = LoadPipelineWidth + 1
   val MainPipeMissReqPort = 0
 
-  // Request
+  // Request  有 2 个来源：2 个 ldu 和 mainPipe，仲裁为 1 个传给 missQueue
   val missReqArb = Module(new Arbiter(new MissReq, MissReqPortCount))
 
   missReqArb.io.in(MainPipeMissReqPort) <> mainPipe.io.miss_req
   for (w <- 0 until LoadPipelineWidth) { missReqArb.io.in(w + 1) <> ldu(w).io.miss_req }
 
+  // 这边把 missReq 传了一份给了 wb，应该是用于检测先后顺序冲突 TODO
   wb.io.miss_req.valid := missReqArb.io.out.valid
   wb.io.miss_req.bits  := missReqArb.io.out.bits.addr
 
   // block_decoupled(missReqArb.io.out, missQueue.io.req, wb.io.block_miss_req)
   missReqArb.io.out <> missQueue.io.req
-  when(wb.io.block_miss_req) {
+  when(wb.io.block_miss_req) {  // 如果 wb 那边检测出来有顺序冲突，给 missQueue 发 cancel 信号
     missQueue.io.req.bits.cancel := true.B
     missReqArb.io.out.ready := false.B
   }
@@ -556,12 +560,14 @@ class DCacheImp(outer: DCache) extends LazyModuleImp(outer) with HasDCacheParame
   // mainPipe
   // when a req enters main pipe, if it is set-conflict with replace pipe or refill pipe,
   // block the req in main pipe
+  // 这里是让 refillPipe 的优先级更高，来阻塞 mainPipe，不过并没有像注释里说得那样按照 Set 阻塞，时序考虑
   block_decoupled(probeQueue.io.pipe_req, mainPipe.io.probe_req, refillPipe.io.req.valid)
   block_decoupled(io.lsu.store.req, mainPipe.io.store_req, refillPipe.io.req.valid)
 
   io.lsu.store.replay_resp := RegNext(mainPipe.io.store_replay_resp)
   io.lsu.store.main_pipe_hit_resp := mainPipe.io.store_hit_resp
 
+  // missQueue 也会发 atomic 请求？ TODO
   arbiter_with_pipereg(
     in = Seq(missQueue.io.main_pipe_req, atomicsReplayUnit.io.pipe_req),
     out = mainPipe.io.atomic_req,
@@ -572,12 +578,14 @@ class DCacheImp(outer: DCache) extends LazyModuleImp(outer) with HasDCacheParame
 
   //----------------------------------------
   // replace (main pipe)
+  // missQueue 发出 replace 请求，交由 mainPipe 处理
   val mpStatus = mainPipe.io.status
   mainPipe.io.replace_req <> missQueue.io.replace_pipe_req
   missQueue.io.replace_pipe_resp := mainPipe.io.replace_resp
 
   //----------------------------------------
   // refill pipe
+  // missQueue 发出 refill 请求，交由 refillPipe 处理；注意当同 Set/Way 的请求还在 mainPipe 里处理的时候，要阻塞 refill
   val refillShouldBeBlocked = (mpStatus.s1.valid && mpStatus.s1.bits.set === missQueue.io.refill_pipe_req.bits.idx) ||
     Cat(Seq(mpStatus.s2, mpStatus.s3).map(s =>
       s.valid &&
@@ -591,7 +599,7 @@ class DCacheImp(outer: DCache) extends LazyModuleImp(outer) with HasDCacheParame
   //----------------------------------------
   // wb
   // add a queue between MainPipe and WritebackUnit to reduce MainPipe stalls due to WritebackUnit busy
-
+  // 注释中说得 queue 在哪？ TODO
   wb.io.req <> mainPipe.io.wb
   bus.c     <> wb.io.mem_release
   wb.io.release_wakeup := refillPipe.io.release_wakeup
@@ -618,6 +626,7 @@ class DCacheImp(outer: DCache) extends LazyModuleImp(outer) with HasDCacheParame
 
   //----------------------------------------
   // replacement algorithm
+  // 这里集中式地管理 replacer 然后传到所有需要的地方
   val replacer = ReplacementPolicy.fromString(cacheParams.replacer, nWays, nSets)
 
   val replWayReqs = ldu.map(_.io.replace_way) ++ Seq(mainPipe.io.replace_way)

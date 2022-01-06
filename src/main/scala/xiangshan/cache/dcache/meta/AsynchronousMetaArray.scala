@@ -48,6 +48,7 @@ class ErrorWriteReq(implicit p: Parameters) extends MetaReadReq {
   val error = Bool()
 }
 
+// 这里的命名应该错了，逻辑是 synchronous 的
 class AsynchronousMetaArray(readPorts: Int, writePorts: Int)(implicit p: Parameters) extends DCacheModule {
   val io = IO(new Bundle() {
     val read = Vec(readPorts, Flipped(DecoupledIO(new MetaReadReq)))

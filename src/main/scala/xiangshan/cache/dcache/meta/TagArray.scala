@@ -100,6 +100,7 @@ class TagArray(implicit p: Parameters) extends DCacheModule {
   io.ecc_read.ready := !ecc_wen
 }
 
+// 这里的 duplicated 是什么意思，之后要看看 TODO
 class DuplicatedTagArray(readPorts: Int)(implicit p: Parameters) extends DCacheModule {
   val io = IO(new Bundle() {
     val read = Vec(readPorts, Flipped(DecoupledIO(new TagReadReq)))
