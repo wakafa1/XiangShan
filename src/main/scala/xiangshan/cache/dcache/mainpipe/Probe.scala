@@ -45,6 +45,7 @@ class ProbeResp(implicit p: Parameters) extends DCacheBundle {
   val id = UInt(log2Up(cfg.nProbeEntries).W)
 }
 
+// Entry 里面逻辑很简单，没啥看的
 class ProbeEntry(implicit p: Parameters) extends DCacheModule {
   val io = IO(new Bundle {
     val req = Flipped(Decoupled(new ProbeReq))
@@ -127,6 +128,7 @@ class ProbeEntry(implicit p: Parameters) extends DCacheModule {
   XSPerfAccumulate("probe_penalty_blocked_by_pipeline", state === s_pipe_req && io.pipe_req.valid && !io.pipe_req.ready)
 }
 
+// 职责是接收 B 通道的 Probe 请求，然后发送给 MainPipe 来处理
 class ProbeQueue(edge: TLEdgeOut)(implicit p: Parameters) extends DCacheModule with HasTLDump with HasPerfEvents
 {
   val io = IO(new Bundle {
@@ -145,10 +147,11 @@ class ProbeQueue(edge: TLEdgeOut)(implicit p: Parameters) extends DCacheModule w
 
   // translate to inner req
   val req = Wire(new ProbeReq)
-  val alias_addr_frag = io.mem_probe.bits.data(2, 1) // add extra 2 bits from vaddr to get vindex
+  val alias_addr_frag = io.mem_probe.bits.data(2, 1) // add extra 2 bits from vaddr to get vindex，这个是处理 Alias 问题的东西
   req.source := io.mem_probe.bits.source
   req.opcode := io.mem_probe.bits.opcode
   req.addr := io.mem_probe.bits.address
+  // 如果有 Alias 问题，把 Alias 的那 2 为拼接进 mem_probe.address 里面，因为 DCache 是虚地址作映射的
   if(DCacheAboveIndexOffset > DCacheTagOffset) {
     // have alias problem, extra alias bits needed for index
     req.vaddr := Cat(
@@ -175,9 +178,10 @@ class ProbeQueue(edge: TLEdgeOut)(implicit p: Parameters) extends DCacheModule w
     entry.io.req.bits  := req
 
     // pipe_req
-    pipe_req_arb.io.in(i) <> entry.io.pipe_req
+    pipe_req_arb.io.in(i) <> entry.io.pipe_req  // Probe Entry 仲裁进入 mainPipe
 
     // pipe_resp
+    // 对于 resp 信号，直接全传递，然后自己内部根据 id 匹配
     entry.io.pipe_resp.valid := io.pipe_req.fire()
     entry.io.pipe_resp.bits.id := io.pipe_req.bits.id
 

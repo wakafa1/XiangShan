@@ -89,6 +89,7 @@ class MainPipeReq(implicit p: Parameters) extends DCacheBundle {
   }
 }
 
+// 处理 Store, Probe, Replace
 class MainPipe(implicit p: Parameters) extends DCacheModule with HasPerfEvents {
   val io = IO(new Bundle() {
     // probe queue
@@ -168,6 +169,9 @@ class MainPipe(implicit p: Parameters) extends DCacheModule with HasPerfEvents {
   // s0: read meta and tag
   val req = Wire(DecoupledIO(new MainPipeReq))
   arbiter(
+    // 这里是对所有的请求做有优先级的仲裁
+    // 1. store 一定要高于 atomic TODO
+    // 2. probe 一定要是最高 TODO
     in = Seq(
       io.probe_req,
       io.replace_req,
@@ -185,7 +189,7 @@ class MainPipe(implicit p: Parameters) extends DCacheModule with HasPerfEvents {
     !io.probe_req.valid && !io.replace_req.valid
   val s0_req = req.bits
   val s0_idx = get_idx(s0_req.vaddr)
-  val s0_can_go = io.meta_read.ready && io.tag_read.ready && s1_ready && !set_conflict
+  val s0_can_go = io.meta_read.ready && io.tag_read.ready && s1_ready && !set_conflict  // 如果 set_conflict 就不让往下走
   val s0_fire = req.valid && s0_can_go
 
   val bank_write = VecInit((0 until DCacheBanks).map(i => get_mask_of_bank(i, s0_req.store_mask).orR)).asUInt
@@ -236,12 +240,14 @@ class MainPipe(implicit p: Parameters) extends DCacheModule with HasPerfEvents {
   val meta_resp = Wire(Vec(nWays, (new Meta).asUInt()))
   val tag_resp = Wire(Vec(nWays, UInt(tagBits.W)))
   val ecc_resp = Wire(Vec(nWays, UInt(eccTagBits.W)))
+  // 这里其实是一个 HoldUnless 的逻辑，因为 S1 可能会卡，所以需要保存那些数据
   meta_resp := Mux(RegNext(s0_fire), VecInit(io.meta_resp.map(_.asUInt)), RegNext(meta_resp))
   tag_resp := Mux(RegNext(s0_fire), VecInit(io.tag_resp.map(r => r(tagBits - 1, 0))), RegNext(tag_resp))
   ecc_resp := Mux(RegNext(s0_fire), VecInit(io.tag_resp.map(r => r(encTagBits - 1, tagBits))), RegNext(ecc_resp))
   val enc_tag_resp = Wire(io.tag_resp.cloneType)
   enc_tag_resp := Mux(RegNext(s0_fire), io.tag_resp, RegNext(enc_tag_resp))
 
+  // 根据读取到的 Tag 和 Meta 信息，判断是否 Hit，并拿到 Hit 那一路的信息
   def wayMap[T <: Data](f: Int => T) = VecInit((0 until nWays).map(f))
   val s1_tag_eq_way = wayMap((w: Int) => tag_resp(w) === get_tag(s1_req.addr)).asUInt
   val s1_tag_match_way = wayMap((w: Int) => s1_tag_eq_way(w) && Meta(meta_resp(w)).coh.isValid()).asUInt
@@ -260,6 +266,7 @@ class MainPipe(implicit p: Parameters) extends DCacheModule with HasPerfEvents {
   val s1_repl_tag = Mux1H(s1_repl_way_en, wayMap(w => tag_resp(w)))
   val s1_repl_coh = Mux1H(s1_repl_way_en, wayMap(w => meta_resp(w))).asTypeOf(new ClientMetadata)
 
+  // 何种情况需要做 replacement? miss了，或者 Store 但是 tag 没有 match
   val s1_need_replacement = (s1_req.miss || s1_req.isStore && !s1_req.probe) && !s1_tag_match
   val s1_way_en = Mux(s1_req.replace, s1_req.replace_way_en, Mux(s1_need_replacement, s1_repl_way_en, s1_tag_match_way))
   val s1_tag = Mux(s1_req.replace, get_tag(s1_req.addr), Mux(s1_need_replacement, s1_repl_tag, s1_hit_tag))
@@ -274,6 +281,7 @@ class MainPipe(implicit p: Parameters) extends DCacheModule with HasPerfEvents {
   val s1_pregen_can_go_to_mq = !s1_req.replace && !s1_req.probe && !s1_req.miss && (s1_req.isStore || s1_req.isAMO) && !s1_hit
 
   // s2: select data, return resp if this is a store miss
+  // 如果是一个 store miss，直接把请求就发给 missQueue 了，无需进入 S3？ TODO
   val s2_valid = RegInit(false.B)
   val s2_req = RegEnable(s1_req, s1_fire)
   val s2_tag_match = RegEnable(s1_tag_match, s1_fire)
@@ -316,12 +324,14 @@ class MainPipe(implicit p: Parameters) extends DCacheModule with HasPerfEvents {
     s2_valid := false.B
   }
   s2_ready := !s2_valid || s2_can_go
+  // 这个 replay 信号代表的是 missQueue 没有准备好，因此只会有 store replay 和 atomic replay
   val replay = !io.miss_req.ready
 
   val data_resp = Wire(io.data_resp.cloneType)
   data_resp := Mux(RegNext(s1_fire), io.data_resp, RegNext(data_resp))
   val s2_store_data_merged = Wire(Vec(DCacheBanks, UInt(DCacheSRAMRowBits.W)))
 
+  // 众所周知，Store 的粒度可能是小的，所以需要与读出来的数据做一个 merge，下面的这一段逻辑就是干这个事情的
   def mergePutData(old_data: UInt, new_data: UInt, wmask: UInt): UInt = {
     val full_wmask = FillInterleaved(8, wmask)
     ((~full_wmask & old_data) | (full_wmask & new_data))
@@ -364,7 +374,8 @@ class MainPipe(implicit p: Parameters) extends DCacheModule with HasPerfEvents {
   val (probe_has_dirty_data, probe_shrink_param, probe_new_coh) = s3_coh.onProbe(s3_req.probe_param)
   val s3_need_replacement = RegEnable(s2_need_replacement, s2_fire_to_s3)
 
-  val miss_update_meta = s3_req.miss
+  // 大多数情况下，s3 这一级还需要写回 meta，一下一些信号就是对应的逻辑
+  val miss_update_meta = s3_req.miss  // only amo miss will refill in main pipe, others will be in missQueue
   val probe_update_meta = s3_req.probe && s3_tag_match && s3_coh =/= probe_new_coh
   val store_update_meta = s3_req.isStore && !s3_req.probe && s3_hit_coh =/= s3_new_hit_coh
   val amo_update_meta = s3_req.isAMO && !s3_req.probe && s3_hit_coh =/= s3_new_hit_coh
@@ -375,6 +386,9 @@ class MainPipe(implicit p: Parameters) extends DCacheModule with HasPerfEvents {
     val c = categorize(cmd)
     MuxLookup(Cat(c, param, dirty), Nothing, Seq(
       //(effect param) -> (next)
+      // rd-只读  wi-未来将写  wr-写
+      // DCache 需要有处理 HuanCun 带来 Dirty 的能力
+      // 这里其实有一个隐含是 toB 一定不能收到 Dirty，这里可以在 HuanCun 那边加一个 Assertion 或者这里加 TODO
       Cat(rd, toB, false.B)  -> Branch,
       Cat(rd, toB, true.B)   -> Branch,
       Cat(rd, toT, false.B)  -> Trunk,
@@ -400,7 +414,7 @@ class MainPipe(implicit p: Parameters) extends DCacheModule with HasPerfEvents {
     )
   )
 
-  // LR, SC and AMO
+  // LR, SC and AMO TODO
   val debug_sc_fail_addr = RegInit(0.U)
   val debug_sc_fail_cnt  = RegInit(0.U(8.W))
 

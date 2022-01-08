@@ -381,11 +381,12 @@ class WritebackEntry(edge: TLEdgeOut)(implicit p: Parameters) extends DCacheModu
 
 class WritebackQueue(edge: TLEdgeOut)(implicit p: Parameters) extends DCacheModule with HasTLDump with HasPerfEvents {
   val io = IO(new Bundle {
-    val req = Flipped(DecoupledIO(new WritebackReq))
+    val req = Flipped(DecoupledIO(new WritebackReq))  // 收 mainPipe 的请求
     val mem_release = DecoupledIO(new TLBundleC(edge.bundle))
     val mem_grant = Flipped(DecoupledIO(new TLBundleD(edge.bundle)))
-
+    // refill 回来之后，会置位 release_wakeup
     val release_wakeup = Flipped(ValidIO(UInt(log2Up(cfg.nMissEntries).W)))
+    // 来自 mainPipe 的 release_update TODO
     val release_update = Flipped(ValidIO(new ReleaseUpdate))
 
     val miss_req = Flipped(Valid(UInt()))
